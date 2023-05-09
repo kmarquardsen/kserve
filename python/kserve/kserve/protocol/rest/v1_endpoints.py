@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import types
 from typing import Optional, Union, Dict, List
+from sse_starlette import EventSourceResponse
 
 from fastapi import Request, Response
 
@@ -68,9 +71,16 @@ class V1Endpoints:
         headers = dict(request.headers.items())
         response, response_headers = await self.dataplane.infer(model_name=model_name, body=body, headers=headers)
 
+        # if isinstance(response, types.AsyncGeneratorType):
+        #     return EventSourceResponse(response)
+        if isinstance(response, EventSourceResponse):
+            return response
+        if isinstance(response, Response):
+            return response
         if not isinstance(response, dict):
-            return Response(content=response, headers=response_headers)
-        return response
+            response = json.loads(response)
+
+        return Response(content=response, headers=response_headers)
 
     async def explain(self, model_name: str, request: Request) -> Union[Response, Dict]:
         """Explain handler.

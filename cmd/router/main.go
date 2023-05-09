@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -40,7 +41,7 @@ import (
 
 var log = logf.Log.WithName("InferenceGraphRouter")
 
-func callService(serviceUrl string, input []byte, headers http.Header) ([]byte, error) {
+func callService(serviceUrl string, input []byte, headers http.Header, sseChan chan<- []byte) ([]byte, error) {
 	defer timeTrack(time.Now(), "step", serviceUrl)
 	log.Info("Entering callService", "url", serviceUrl)
 	req, err := http.NewRequest("POST", serviceUrl, bytes.NewBuffer(input))
@@ -53,7 +54,6 @@ func callService(serviceUrl string, input []byte, headers http.Header) ([]byte, 
 	}
 	req.Header.Add("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
-
 	if err != nil {
 		log.Error(err, "An error has occurred from service", "service", serviceUrl)
 		return nil, err
@@ -62,6 +62,20 @@ func callService(serviceUrl string, input []byte, headers http.Header) ([]byte, 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Error(err, "error while reading the response")
+	}
+	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		go func() {
+			sse := bufio.NewScanner(resp.Body)
+			for sse.Scan() {
+				event := sse.Bytes()
+				if len(event) > 0 {
+					sseChan <- event
+				}
+			}
+			if err := sse.Err(); err != nil {
+				log.Error(err, "error while reading the SSE response")
+			}
+		}()
 	}
 	return body, err
 }
@@ -97,19 +111,19 @@ func timeTrack(start time.Time, nodeOrStep string, name string) {
 	log.Info("elapsed time", nodeOrStep, name, "time", elapsed)
 }
 
-func routeStep(nodeName string, graph v1alpha1.InferenceGraphSpec, input []byte, headers http.Header) ([]byte, error) {
+func routeStep(nodeName string, graph v1alpha1.InferenceGraphSpec, input []byte, headers http.Header, sseChan chan<- []byte) ([]byte, error) {
 	defer timeTrack(time.Now(), "node", nodeName)
 	currentNode := graph.Nodes[nodeName]
 
 	if currentNode.RouterType == v1alpha1.Splitter {
-		return executeStep(pickupRoute(currentNode.Steps), graph, input, headers)
+		return executeStep(pickupRoute(currentNode.Steps), graph, input, headers, sseChan)
 	}
 	if currentNode.RouterType == v1alpha1.Switch {
 		route := pickupRouteByCondition(input, currentNode.Steps)
 		if route == nil {
 			return input, nil //TODO maybe should fail in this case?
 		}
-		return executeStep(route, graph, input, headers)
+		return executeStep(route, graph, input, headers, sseChan)
 	}
 	if currentNode.RouterType == v1alpha1.Ensemble {
 		ensembleRes := make([]chan map[string]interface{}, len(currentNode.Steps))
@@ -119,7 +133,7 @@ func routeStep(nodeName string, graph v1alpha1.InferenceGraphSpec, input []byte,
 			resultChan := make(chan map[string]interface{})
 			ensembleRes[i] = resultChan
 			go func() {
-				output, err := executeStep(step, graph, input, headers)
+				output, err := executeStep(step, graph, input, headers, nil)
 				if err == nil {
 					var res map[string]interface{}
 					if err = json.Unmarshal(output, &res); err == nil {
@@ -164,8 +178,14 @@ func routeStep(nodeName string, graph v1alpha1.InferenceGraphSpec, input []byte,
 					return responseBytes, nil
 				}
 			}
-			if responseBytes, err = executeStep(step, graph, request, headers); err != nil {
+			if responseBytes, err = executeStep(step, graph, request, headers, sseChan); err != nil {
 				return nil, err
+			}
+			if headers.Get("Accept") == "text/event-stream" {
+				if sseChan != nil {
+					sseChan <- responseBytes
+				}
+				return nil, nil // return nil to avoid sending response to the client
 			}
 		}
 		return responseBytes, nil
@@ -174,25 +194,69 @@ func routeStep(nodeName string, graph v1alpha1.InferenceGraphSpec, input []byte,
 	return nil, fmt.Errorf("invalid route type: %v", currentNode.RouterType)
 }
 
-func executeStep(step *v1alpha1.InferenceStep, graph v1alpha1.InferenceGraphSpec, input []byte, headers http.Header) ([]byte, error) {
-	if step.NodeName != "" {
-		// when nodeName is specified make a recursive call for routing to next step
-		return routeStep(step.NodeName, graph, input, headers)
+func executeStep(step *v1alpha1.InferenceStep, graph v1alpha1.InferenceGraphSpec, input []byte, headers http.Header, sseChan chan<- []byte) ([]byte, error) {
+	if step.NodeName != "" && headers.Get("Accept") != "text/event-stream" {
+		// when nodeName is specified and not an sse request, make a recursive call for routing to next step
+		return routeStep(step.NodeName, graph, input, headers, sseChan)
 	}
-	return callService(step.ServiceURL, input, headers)
+	return callService(step.ServiceURL, input, headers, sseChan)
 }
 
 var inferenceGraph *v1alpha1.InferenceGraphSpec
 
 func graphHandler(w http.ResponseWriter, req *http.Request) {
 	inputBytes, _ := io.ReadAll(req.Body)
-	if response, err := routeStep(v1alpha1.GraphRootNodeName, *inferenceGraph, inputBytes, req.Header); err != nil {
+	sseChan := make(chan []byte) // initialize SSE channel
+	if response, err := routeStep(v1alpha1.GraphRootNodeName, *inferenceGraph, inputBytes, req.Header, sseChan); err != nil {
 		log.Error(err, "failed to process request")
-		w.WriteHeader(500) //TODO status code tbd
+		w.WriteHeader(http.StatusInternalServerError) //TODO status code tbd
 		w.Write([]byte(fmt.Sprintf("Failed to process request: %v", err)))
 	} else {
-		w.Write(response)
+		if json.Valid(response) {
+			w.Header().Set("Content-Type", "application/json")
+		}
+		// is SSE request
+		if req.Header.Get("Accept") == "text/event-stream" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("Transfer-Encoding", "chunked")
+			w.Header().Set("X-Accel-Buffering", "no")
+
+			f, ok := w.(http.Flusher)
+			if !ok {
+				log.Error(nil, "http.ResponseWriter does not support Flusher interface")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte("Failed to process request"))
+				return
+			}
+
+			for {
+				if eventBytes, ok := <-sseChan; ok {
+					var event SSEEvent
+					if err := json.Unmarshal(eventBytes, &event); err != nil {
+						log.Error(err, "failed to unmarshal SSE event")
+						w.WriteHeader(http.StatusInternalServerError)
+						w.Write([]byte("Failed to process request"))
+						return
+					}
+					fmt.Fprintf(w, "event: %s\n", event.Name)
+					fmt.Fprintf(w, "data: %s\n", event.Data)
+					f.Flush()
+				} else {
+					break
+				}
+			}
+		} else {
+			// non-SSE request
+			w.Write(response)
+		}
 	}
+}
+
+type SSEEvent struct {
+	Name string `json:"name"`
+	Data string `json:"data"`
 }
 
 var (
